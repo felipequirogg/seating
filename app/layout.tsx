@@ -2,7 +2,7 @@ import type { Metadata } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "AATA Inclusion",
+  title: "Seating",
   description: "Muy pronto vas a poder encontrar acá toda la información.",
 };
 
