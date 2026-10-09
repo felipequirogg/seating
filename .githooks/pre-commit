@@ -1,0 +1,98 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Pre-commit hook: block known attack patterns (campaign A12-1309CM)
+# Excluded from checks: SECURITY.md, .githooks/*, .github/workflows/security-scan.yml
+
+RED='\033[0;31m'
+NC='\033[0m'
+EXIT_CODE=0
+
+staged_files() {
+  git diff --cached --name-only --diff-filter=ACM
+}
+
+fail() {
+  echo -e "${RED}BLOCKED:${NC} $1" >&2
+  EXIT_CODE=1
+}
+
+# --- Check 1: oversized postcss.config.* ---
+while IFS= read -r f; do
+  case "$f" in
+    postcss.config.*)
+      size=$(git cat-file -s ":$f" 2>/dev/null || echo 0)
+      if [ "$size" -gt 500 ]; then
+        fail "$f is $size bytes (limit 500) — possible payload"
+      fi
+      ;;
+  esac
+done < <(staged_files)
+
+# --- Check 2 & 3: obfuscation patterns and C2 indicators ---
+# OJO: se usa grep -E (ERE), NO -P. El grep de macOS no tiene -P: con -P estos dos controles fallaban
+# en silencio y no bloqueaban nada (descubierto el 08-oct-2026). Tampoco se usa tubería con `echo` porque,
+# con pipefail y contenido grande, un SIGPIPE podía hacer que un match pasara por «no match».
+OBFUSCATION_PATTERNS='_0x[a-f0-9]{4,}|a0_0x[a-f0-9]{4,}|createRequire.*createRequire|eval\(atob\('
+C2_PATTERNS='A12-1309CM|166\.88\.134\.75|193\.247\.144\.38|1rpc\.io/eth|eth\.drpc\.org|eth-mainnet\.public\.blastapi\.io|ETH_RPC_URL|global\[.?_[VH].?\]|spawn\(process\.execPath'
+
+while IFS= read -r f; do
+  # Skip excluded paths
+  case "$f" in
+    SECURITY.md|.githooks/*|.github/workflows/security-scan.yml) continue ;;
+  esac
+
+  content=$(git show ":$f" 2>/dev/null) || continue
+
+  if grep -qEi "$OBFUSCATION_PATTERNS" <<<"$content"; then
+    fail "$f contains obfuscated code patterns"
+  fi
+
+  if grep -qEi "$C2_PATTERNS" <<<"$content"; then
+    fail "$f contains known C2 indicators"
+  fi
+done < <(staged_files)
+
+# --- Check 4: .gitignore must not hide attack artifacts ---
+if git diff --cached --name-only --diff-filter=ACM | grep -q '^\.gitignore$'; then
+  gi_content=$(git show ":.gitignore" 2>/dev/null) || gi_content=""
+  for pattern in "branch_structure.json" "temp_auto_push.bat" "temp_interactive_push.bat"; do
+    if echo "$gi_content" | grep -qF "$pattern"; then
+      fail ".gitignore contains suspicious entry: $pattern"
+    fi
+  done
+fi
+
+# --- Check 5: VS Code tasks that run when the folder is opened ---
+while IFS= read -r f; do
+  case "$f" in
+    */tasks.json|tasks.json)
+      if git show ":$f" 2>/dev/null | grep -q 'folderOpen'; then
+        fail "$f runs a task automatically when the folder is opened (folderOpen)"
+      fi
+      ;;
+    */.vscode/settings.json|.vscode/settings.json)
+      if git show ":$f" 2>/dev/null | grep -qE '"task\.allowAutomaticTasks"[[:space:]]*:[[:space:]]*(true|"on")'; then
+        fail "$f lets VS Code run automatic tasks without asking"
+      fi
+      ;;
+  esac
+done < <(staged_files)
+
+# --- Check 6: font files must start with their real signature (not a script in disguise) ---
+while IFS= read -r f; do
+  case "$f" in
+    *.woff2) ok="774f4632" ;;
+    *.woff)  ok="774f4646" ;;
+    *.ttf)   ok="00010000 74727565" ;;
+    *.otf)   ok="4f54544f" ;;
+    *) continue ;;
+  esac
+  magic=$(git show ":$f" 2>/dev/null | head -c 4 | od -An -tx1 | tr -d ' \n')
+  case " $ok " in
+    *" $magic "*) ;;
+    *) fail "$f is not a real font file (starts with '$magic'): looks like a script in disguise" ;;
+  esac
+done < <(staged_files)
+
+exit $EXIT_CODE
